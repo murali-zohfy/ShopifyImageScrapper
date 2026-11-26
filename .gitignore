@@ -1,0 +1,14 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Personal settings (created automatically on first run)
+config.json
+
+# Output
+csv/
+downloads/
+*.partial.csv
+*.progress.json
+*.saving.tmp

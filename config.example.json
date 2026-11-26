@@ -1,0 +1,9 @@
+{
+  "store_url": "https://your-store.com",
+  "collection": "",
+  "csv_dir": "C:/path/to/your/csv-folder",
+  "delay": 2.0,
+  "cooldown": 60,
+  "max_cooldown": 900,
+  "max_blocks": 6
+}

@@ -1,8 +1,9 @@
 """
-Product image-link scraper -> one master CSV per site.
+Shopify Image Scraper -> one master CSV per store.
 
-No images are downloaded. The CSV lists every product with its colour, sizes and
-image links, and ends with the total number of (unique) products:
+Collects every product's image links from any Shopify store, with the product
+name, colour and sizes, and ends with the total number of (unique) products.
+No images are downloaded.
 
     S.No, Product Name, Color, Size, Image No, Image Link
     1,    Round Neck T-Shirt - Cosmic Sapphire, Cosmic Sapphire, "S, M, L", 1, https://...
@@ -10,12 +11,9 @@ image links, and ends with the total number of (unique) products:
     ...
     Total Products, 1234
 
-Works on any store:
-  * shopify  - the store's public Storefront API (GraphQL, 250 products per request,
-               a whole store in under a minute), falling back to /products.json.
-  * generic  - any other site: product links from sitemap.xml or a listing page,
-               images from JSON-LD, og:image and an optional CSS selector.
-  * auto     - (default) shopify if the site supports it, otherwise generic.
+Sources (both public, fastest first):
+  1. Storefront API  /api/<version>/graphql.json  (no key needed, 250 products per request)
+  2. /products.json  (classic feed, used if a store turns the Storefront API off)
 
 See README.md for how to run it.
 """
@@ -34,11 +32,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
-from urllib.parse import urljoin, urlparse, urlunparse
-from xml.etree import ElementTree
+from urllib.parse import urljoin, urlparse
 
 import requests
-from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 
 log = logging.getLogger("scraper")
@@ -229,7 +225,7 @@ def color_from_title(title: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Strategy: Shopify
+# Shopify
 # --------------------------------------------------------------------------- #
 COLOR_NAMES = {"color", "colour", "colors", "colours", "shade"}
 SIZE_NAMES = {"size", "sizes"}
@@ -409,149 +405,6 @@ class ShopifyScraper:
 
 
 # --------------------------------------------------------------------------- #
-# Strategy: Generic (sitemap / listing page + product HTML)
-# --------------------------------------------------------------------------- #
-class GenericScraper:
-    def __init__(self, session: requests.Session, base: str, product_pattern: str = r"/products?/",
-                 image_selector: str | None = None, start_urls: list[str] | None = None):
-        self.s, self.base = session, base
-        self.pattern = re.compile(product_pattern)
-        self.image_selector = image_selector
-        self.start_urls = start_urls or []
-
-    # ---- find product URLs ------------------------------------------------
-    def _sitemaps(self) -> list[str]:
-        found = [f"{self.base}/sitemap.xml", f"{self.base}/sitemap_index.xml"]
-        try:
-            r = self.s.get(f"{self.base}/robots.txt", timeout=20)
-            if r.ok:
-                found = re.findall(r"(?im)^sitemap:\s*(\S+)", r.text) + found
-        except (requests.RequestException, BlockedError):
-            pass
-        return dedupe(found)
-
-    def _walk_sitemap(self, url: str, seen: set) -> Iterator[str]:
-        if url in seen:
-            return
-        seen.add(url)
-        try:
-            r = self.s.get(url, timeout=30)
-            if not r.ok:
-                log.warning("sitemap %s -> HTTP %s. Try --start-url with a listing page.", url, r.status_code)
-                return
-            root = ElementTree.fromstring(r.content)
-        except Exception as e:
-            log.debug("sitemap %s failed: %s", url, e)
-            return
-        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-        for loc in root.findall("sm:sitemap/sm:loc", ns):
-            yield from self._walk_sitemap(loc.text.strip(), seen)
-        for loc in root.findall("sm:url/sm:loc", ns):
-            yield loc.text.strip()
-
-    def _links_from_page(self, url: str) -> Iterator[str]:
-        r = self.s.get(url, timeout=30)
-        if not r.ok:
-            log.warning("start page %s -> HTTP %s", url, r.status_code)
-            return
-        for a in BeautifulSoup(r.text, "html.parser").select("a[href]"):
-            yield urljoin(url, a["href"]).split("#")[0]
-
-    def product_urls(self) -> Iterator[str]:
-        if self.start_urls:
-            source = (u for su in self.start_urls for u in self._links_from_page(su))
-        else:
-            seen_maps: set[str] = set()
-            source = (u for sm in self._sitemaps() for u in self._walk_sitemap(sm, seen_maps))
-        seen: set[str] = set()
-        for u in source:
-            parts = urlparse(u)
-            if parts.netloc.endswith(site_name(self.base)) and self.pattern.search(parts.path):
-                u = urlunparse(parts._replace(query="", fragment=""))
-                if u not in seen:
-                    seen.add(u)
-                    yield u
-
-    # ---- read one product page ----------------------------------------------
-    @staticmethod
-    def _jsonld_products(soup: BeautifulSoup) -> list[dict]:
-        found = []
-
-        def visit(node):
-            if isinstance(node, list):
-                for n in node:
-                    visit(n)
-            elif isinstance(node, dict):
-                t = node.get("@type")
-                if t in ("Product", "ProductGroup") or (isinstance(t, list) and "Product" in t):
-                    found.append(node)
-                for k in ("@graph", "mainEntity"):
-                    if k in node:
-                        visit(node[k])
-
-        for tag in soup.find_all("script", type="application/ld+json"):
-            try:
-                visit(json.loads(tag.string or ""))
-            except (json.JSONDecodeError, TypeError):
-                continue
-        return found
-
-    @staticmethod
-    def _img_src(tag) -> str | None:
-        for attr in ("data-zoom", "data-large", "data-src", "data-original", "src"):
-            if tag.get(attr):
-                return tag[attr]
-        srcset = tag.get("srcset") or tag.get("data-srcset")
-        return srcset.split(",")[-1].strip().split(" ")[0] if srcset else None
-
-    def product(self, url: str) -> Product:
-        r = self.s.get(url, timeout=30)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        images, colors, sizes, title = [], [], [], ""
-
-        def as_list(x):
-            return x if isinstance(x, list) else ([x] if x else [])
-
-        for p in self._jsonld_products(soup):
-            title = title or p.get("name", "")
-            for i in as_list(p.get("image")):
-                i = i.get("url") or i.get("contentUrl") if isinstance(i, dict) else i
-                if isinstance(i, str):
-                    images.append(i)
-            for v in [p] + as_list(p.get("hasVariant")) + as_list(p.get("offers")):
-                if isinstance(v, dict):
-                    colors += [str(c) for c in as_list(v.get("color"))]
-                    sizes += [str(s.get("name") if isinstance(s, dict) else s) for s in as_list(v.get("size"))]
-
-        if self.image_selector:
-            for tag in soup.select(self.image_selector):
-                src = self._img_src(tag) if tag.name in ("img", "source") else tag.get("href")
-                if src:
-                    images.append(src)
-        for m in soup.select('meta[property="og:image"], meta[property="og:image:secure_url"]'):
-            if m.get("content"):
-                images.append(m["content"])
-
-        if not title:
-            og = soup.select_one('meta[property="og:title"]')
-            h1 = soup.select_one("h1")
-            title = ((og.get("content") if og else None) or (h1.get_text(" ", strip=True) if h1 else None)
-                     or (soup.title.string if soup.title else "") or url)
-
-        images = [abs_url(i, self.base) for i in images if not i.startswith("data:")]
-        return Product(title=title.strip(), url=url, images=dedupe(images),
-                       color=", ".join(dedupe(colors)), size=", ".join(dedupe(sizes)))
-
-    def products(self) -> Iterator[Product]:
-        for url in self.product_urls():
-            try:
-                yield self.product(url)
-            except requests.RequestException as e:
-                log.warning("skip %s: %s", url, e)
-
-
-# --------------------------------------------------------------------------- #
 # Master CSV
 # --------------------------------------------------------------------------- #
 class MasterCsv:
@@ -631,7 +484,7 @@ def collect(products: Iterator[Product], master: MasterCsv, scraper, resume_info
     """Pull products into the master CSV. The CSV (and, for Shopify, the resume point)
     is saved after every list page, so an interruption never loses finished pages."""
     stats = {"added": 0, "no_images": 0, "error": None, "finished": False}
-    paged = isinstance(scraper, ShopifyScraper) and resume_info is not None
+    paged = resume_info is not None
     current_page = None
     try:
         for p in products:
@@ -644,8 +497,6 @@ def collect(products: Iterator[Product], master: MasterCsv, scraper, resume_info
                 current_page = p.page
             if master.add(p):
                 stats["added"] += 1
-                if not paged and stats["added"] % 50 == 0:
-                    master.save()  # non-paged sites: save every 50 products
             elif not p.images:
                 stats["no_images"] += 1
         else:
@@ -669,24 +520,40 @@ def collect(products: Iterator[Product], master: MasterCsv, scraper, resume_info
 # --------------------------------------------------------------------------- #
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
+EXAMPLE_CONFIG_PATH = HERE / "config.example.json"
+DEFAULT_CSV_DIR = HERE / "csv"
 DEFAULT_CONFIG = {
-    "csv_dir": "",          # where the CSV goes; empty = ask when the script starts
-    "ask_path_every_run": False,
+    "store_url": "https://your-store.com",       # placeholder -> asked in the terminal
+    "collection": "",                           # "" = whole store, or a collection handle e.g. "men"
+    "csv_dir": "C:/path/to/your/csv-folder",    # placeholder -> asked in the terminal
     # ---- rate-limit control ----
-    "delay": 2.0,           # seconds between requests to the website
+    "delay": 2.0,           # seconds between requests to the store
     "cooldown": 60,         # first pause (seconds) when blocked; doubles each time
     "max_cooldown": 900,    # longest single pause (15 min)
-    "max_blocks": 6,        # pauses in a row before stopping (re-run later)
+    "max_blocks": 6,        # pauses in a row before stopping (re-run later to resume)
 }
 
 
+def is_placeholder(value) -> bool:
+    """True for empty values and the example values shipped in config.example.json."""
+    v = str(value or "").strip().replace("\\", "/").lower()
+    return not v or "your-store" in v or "path/to/" in v or v.startswith("<")
+
+
 def load_config() -> dict:
+    """config.json is personal (not in git). On the first run it's created from
+    config.example.json, so it starts with placeholders that get asked for."""
+    if not CONFIG_PATH.exists():
+        src = EXAMPLE_CONFIG_PATH.read_text(encoding="utf-8") if EXAMPLE_CONFIG_PATH.exists() \
+            else json.dumps(DEFAULT_CONFIG, indent=2)
+        CONFIG_PATH.write_text(src, encoding="utf-8")
     cfg = dict(DEFAULT_CONFIG)
-    saved = {}
-    if CONFIG_PATH.exists():
+    try:
         saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        cfg.update({k: v for k, v in saved.items() if k in DEFAULT_CONFIG})
-    if set(saved) != set(DEFAULT_CONFIG):  # new file, or old/extra keys -> tidy it up
+    except json.JSONDecodeError as e:
+        sys.exit(f"config.json is not valid JSON ({e}). Fix it, or delete it to start from the example.")
+    cfg.update({k: v for k, v in saved.items() if k in DEFAULT_CONFIG})
+    if set(saved) != set(DEFAULT_CONFIG):  # old/extra/missing keys -> tidy it up
         save_config(cfg)
     return cfg
 
@@ -703,67 +570,103 @@ def ask(question: str, default: str = "") -> str:
     return ans or default
 
 
+def remember(cfg: dict, key: str, value: str, what: str, no_prompt: bool) -> None:
+    if no_prompt or cfg.get(key) == value:
+        return
+    if ask(f"Save this {what} in config.json for next time? (y/n)", "y").lower().startswith("y"):
+        cfg[key] = value
+        save_config(cfg)
+
+
+def usable_folder(folder: str) -> Path | None:
+    """The folder as a Path if it exists or can be created, else None."""
+    try:
+        path = Path(os.path.expandvars(os.path.expanduser(folder)))
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    except OSError as e:
+        log.warning("Can't use the folder %r (%s).", folder, e)
+        return None
+
+
 def resolve_csv_dir(args: argparse.Namespace, cfg: dict) -> Path:
-    """CSV folder from: --csv-out flag, then config.json, then a question."""
-    folder = args.csv_out or cfg.get("csv_dir") or ""
-    if not args.no_prompt and not args.csv_out and (cfg.get("ask_path_every_run") or not folder):
-        folder = ask("\nFolder to save the CSV in (Enter = default)", folder or str(HERE / "csv"))
-        if folder != cfg.get("csv_dir") and ask("Remember this folder? (y/n)", "y").lower().startswith("y"):
-            cfg["csv_dir"] = folder
-            save_config(cfg)
-    folder = folder or str(HERE / "csv")
-    return Path(os.path.expandvars(os.path.expanduser(folder)))
+    """CSV folder: --csv-out, then config.json, then a question in the terminal.
+    A placeholder, empty or unusable path falls through to the next option."""
+    for folder in (args.csv_out, cfg.get("csv_dir")):
+        if folder and not is_placeholder(folder) and (path := usable_folder(folder)):
+            return path
+    if args.no_prompt:
+        log.info("No usable CSV folder in config.json; using %s", DEFAULT_CSV_DIR)
+        return usable_folder(str(DEFAULT_CSV_DIR)) or DEFAULT_CSV_DIR
+    while True:
+        folder = ask("Folder to save the CSV in (Enter = default)", str(DEFAULT_CSV_DIR))
+        if path := usable_folder(folder):
+            remember(cfg, "csv_dir", folder, "folder", args.no_prompt)
+            return path
+        print("  That folder can't be used. Try another one.")
 
 
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def parse_args(argv=None) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Collect product image links into one master CSV.")
-    ap.add_argument("url", nargs="?", help="Site URL, e.g. https://www.jockey.in (asked if omitted)")
-    ap.add_argument("--site", help="Use a saved site from sites.json")
+    ap = argparse.ArgumentParser(
+        description="Collect every product's image links from a Shopify store into one master CSV.")
+    ap.add_argument("url", nargs="?", help="Store URL, e.g. https://www.jockey.in (else config.json, else asked)")
+    ap.add_argument("--site", help="Use a saved store from sites.json")
     ap.add_argument("--sites-file", default=str(HERE / "sites.json"))
+    ap.add_argument("--collection", help="Only one collection, e.g. 'men' (from /collections/men)")
     ap.add_argument("--csv-out", help="CSV folder for this run (overrides config.json)")
-    ap.add_argument("--no-prompt", action="store_true", help="Never ask questions")
-    ap.add_argument("--mode", choices=("auto", "shopify", "generic"))
-    ap.add_argument("--collection", help="Shopify only: one category, e.g. 'men'")
-    ap.add_argument("--product-pattern", help=r"Generic: regex product URL paths match (default /products?/)")
-    ap.add_argument("--image-selector", help="Generic: CSS selector for gallery images")
-    ap.add_argument("--start-url", action="append", help="Generic: listing page to collect product links from")
     ap.add_argument("--max-products", type=int, help="Stop after N products (for testing)")
     ap.add_argument("--delay", type=float, help="Seconds between requests (overrides config.json)")
     ap.add_argument("--fresh", action="store_true",
-                    help="Ignore an unfinished earlier run and start again from page 1")
+                    help="Ignore an unfinished earlier run and start again from the beginning")
     ap.add_argument("--start-page", type=int,
-                    help="Shopify: continue from this list page, adding to the existing CSV")
-    ap.add_argument("-v", "--verbose", action="store_true")
+                    help="Continue from /products.json page N, adding to the existing CSV")
+    ap.add_argument("--no-prompt", action="store_true", help="Never ask questions (for scripts/schedulers)")
+    ap.add_argument("-v", "--verbose", action="store_true", help="Detailed log")
     args = ap.parse_args(argv)
 
     profiles = {}
     if Path(args.sites_file).exists():
         profiles = json.loads(Path(args.sites_file).read_text(encoding="utf-8"))
-
-    if not args.url and not args.site and not args.no_prompt:
-        if profiles:
-            print("Saved sites:", ", ".join(profiles))
-        answer = ask("Site URL or saved site name")
-        args.site, args.url = (answer, None) if answer in profiles else (None, answer)
-        if not args.max_products:
-            n = ask("How many products? (Enter = all)")
-            args.max_products = int(n) if n.isdigit() else None
-
     if args.site:
         if args.site not in profiles:
-            sys.exit(f"'{args.site}' is not in {args.sites_file}. Saved sites: {', '.join(profiles)}")
+            sys.exit(f"'{args.site}' is not in {args.sites_file}. Saved stores: {', '.join(profiles)}")
         for k, v in profiles[args.site].items():
             k = k.replace("-", "_")
             if getattr(args, k, None) in (None, False):  # command-line flags win
                 setattr(args, k, v)
-    if not args.url:
-        ap.error("give a site URL or --site")
-    if isinstance(args.start_url, str):
-        args.start_url = [args.start_url]
+    args.profiles = profiles
     return args
+
+
+def resolve_store(args: argparse.Namespace, cfg: dict) -> None:
+    """Store URL: command line / --site, then config.json, then a question in the terminal."""
+    if not args.url and not is_placeholder(cfg.get("store_url")):
+        args.url = cfg["store_url"]
+        if args.collection is None and cfg.get("collection"):
+            args.collection = cfg["collection"]
+    if args.url:
+        return
+    if args.no_prompt:
+        sys.exit("No store URL. Give one (shopify_scraper.py https://store.com), use --site, "
+                 "or set \"store_url\" in config.json.")
+    if args.profiles:
+        print("Saved stores (sites.json):", ", ".join(args.profiles))
+    while not args.url:
+        answer = ask("Store URL or saved store name (e.g. https://www.jockey.in)")
+        if answer in args.profiles:
+            args.site = answer
+            for k, v in args.profiles[answer].items():
+                if getattr(args, k.replace("-", "_"), None) in (None, False):
+                    setattr(args, k.replace("-", "_"), v)
+        elif answer:
+            args.url = answer
+            remember(cfg, "store_url", normalize_base(answer), "store", args.no_prompt)
+    if args.max_products is None:
+        n = ask("How many products? (Enter = all)")
+        args.max_products = int(n) if n.isdigit() else None
 
 
 def main(argv=None) -> None:
@@ -771,27 +674,27 @@ def main(argv=None) -> None:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
     cfg = load_config()
+    resolve_store(args, cfg)
     csv_dir = resolve_csv_dir(args, cfg)
     delay = cfg["delay"] if args.delay is None else args.delay
 
     base = normalize_base(args.url)
     session = make_session(delay=delay, cooldown=cfg["cooldown"],
                            max_cooldown=cfg["max_cooldown"], max_blocks=cfg["max_blocks"])
-    mode = args.mode or "auto"
-    if mode == "auto":
-        mode = "shopify" if ShopifyScraper.detect(session, base) else "generic"
-    log.info("Site: %s  |  method: %s  |  %.1fs between requests", base, mode, delay)
-    if mode == "shopify":
-        log.info("Using Shopify's Storefront API (falls back to /products.json if the store blocks it).")
+    log.info("Store: %s%s  |  %.1fs between requests", base,
+             f"  |  collection: {args.collection}" if args.collection else "", delay)
+    if not ShopifyScraper.detect(session, base):
+        sys.exit(f"\n{base} doesn't look like a Shopify store (or it's blocking us right now).\n"
+                 "Tip: some stores use a custom front-end; try the store's xxx.myshopify.com address.")
 
     site = site_name(base)
     suffix = f"_{safe_filename(args.collection)}" if args.collection else ""
     master = MasterCsv(csv_dir / f"{site}{suffix}_products.csv")
 
-    # ---- resume an unfinished run? (Shopify only; test runs with --max-products never resume)
+    # ---- resume an unfinished run? (test runs with --max-products never resume)
     resume_info = None
     start_page, cursor, api = 1, None, "auto"
-    if mode == "shopify" and not args.max_products:
+    if not args.max_products:
         resume_info = {"site": base, "collection": args.collection or ""}
         progress = master.load_progress()
         same_run = progress and {k: progress.get(k) for k in resume_info} == resume_info
@@ -812,14 +715,11 @@ def main(argv=None) -> None:
         else:
             master.clear_progress()
 
-    if mode == "shopify":
-        scraper = ShopifyScraper(session, base, collection=args.collection, start_page=start_page,
-                                 cursor=cursor, api=api)
-    else:
-        scraper = GenericScraper(session, base, product_pattern=args.product_pattern or r"/products?/",
-                                 image_selector=args.image_selector, start_urls=args.start_url)
-
+    scraper = ShopifyScraper(session, base, collection=args.collection, start_page=start_page,
+                             cursor=cursor, api=api)
+    started = time.monotonic()
     stats = collect(scraper.products(), master, scraper, resume_info, max_products=args.max_products)
+    took = time.monotonic() - started
 
     print()
     print("=" * 60)
@@ -829,7 +729,9 @@ def main(argv=None) -> None:
     if stats["no_images"]:
         print(f"  Skipped        : {stats['no_images']} product(s) with no images")
     if session.blocks:
-        print(f"  Rate limits    : site slowed us down {session.blocks} time(s); handled automatically")
+        print(f"  Rate limits    : store slowed us down {session.blocks} time(s); handled automatically")
+    print(f"  Source         : {'Storefront API' if scraper.used == 'storefront' else '/products.json'}")
+    print(f"  Time           : {took:.0f}s")
     print(f"  Master CSV     : {master.path.resolve()}")
     print("=" * 60)
     if stats["error"]:

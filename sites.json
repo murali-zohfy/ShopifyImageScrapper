@@ -1,18 +1,5 @@
 {
-  "jockey": {
-    "url": "https://www.jockey.in",
-    "mode": "shopify"
-  },
-  "jockey-men": {
-    "url": "https://www.jockey.in",
-    "mode": "shopify",
-    "collection": "men"
-  },
-  "books-demo": {
-    "url": "https://books.toscrape.com",
-    "mode": "generic",
-    "start_url": ["https://books.toscrape.com/"],
-    "product_pattern": "^/catalogue/(?!category)[^/]+/index\\.html$",
-    "image_selector": "#product_gallery img"
-  }
+  "jockey":     { "url": "https://www.jockey.in" },
+  "jockey-men": { "url": "https://www.jockey.in", "collection": "men" },
+  "allbirds":   { "url": "https://www.allbirds.com" }
 }

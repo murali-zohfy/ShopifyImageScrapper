@@ -107,7 +107,7 @@ class PoliteSession(requests.Session):
             self._next_ok[host] = start + self._cur_delay(host) * (1 + random.random() * 0.5)
         if start > now:
             if start - now >= 5:
-                log.info("Waiting %ds before the next request (safe pace) ...", start - now)
+                log.info("⏳ Waiting %ds before the next request (safe pace)", start - now)
             time.sleep(start - now)
 
     def _on_success(self, host: str) -> None:
@@ -117,7 +117,7 @@ class PoliteSession(requests.Session):
             if cur > self.delay and self._ok_streak[host] >= self.RECOVER_AFTER:
                 self._host_delay[host] = max(self.delay, cur * 0.75)
                 self._ok_streak[host] = 0
-                log.info("%s: no blocks for a while, delay lowered to %.1fs", host, self._host_delay[host])
+                log.info("No blocks for a while · delay back down to %.1fs", self._host_delay[host])
 
     @staticmethod
     def _looks_blocked(r: requests.Response) -> bool:
@@ -163,9 +163,8 @@ class PoliteSession(requests.Session):
                 ceiling = max(self.SLOWEST, self.delay * 2)
                 self._host_delay[host] = min(max(self._cur_delay(host) * 2, 0.5), ceiling)
                 self._ok_streak[host] = 0
-            log.warning("%s is rate-limiting us (%s). Pausing %ds, then retrying (%d/%d). "
-                        "New delay: %.1fs", host, why, pause, strikes, self.max_blocks,
-                        self._host_delay[host])
+            log.warning("Store is rate-limiting (%s) · pausing %ds · retry %d/%d · delay now %.1fs",
+                        why, pause, strikes, self.max_blocks, self._host_delay[host])
             if r is not None:
                 r.close()
 
@@ -192,7 +191,12 @@ def normalize_base(url: str) -> str:
 
 
 def site_name(base: str) -> str:
-    return re.sub(r"^www\.", "", urlparse(base).netloc.lower()).split(":")[0]
+    """'https://www.jockey.in' -> 'jockey', 'https://shop.allbirds.com' -> 'allbirds'."""
+    host = urlparse(base).netloc.lower().split(":")[0]
+    if host.replace(".", "").isdigit():  # an IP address, e.g. a local test store
+        return host.replace(".", "-")
+    labels = [x for x in host.split(".") if x not in ("www", "shop", "store")]
+    return (labels[0] if labels else host) or "store"
 
 
 def safe_filename(name: str) -> str:
@@ -338,7 +342,7 @@ class ShopifyScraper:
                 yield from self._storefront()
                 return
             except StorefrontUnavailable as e:
-                log.info("Storefront API not available here (%s); using /products.json instead.", e)
+                log.info("Storefront API is off on this store (%s) · switching to /products.json", e)
                 # different ordering -> restart the list; products already in the CSV are skipped
                 self.page, self.cursor = 1, None
         yield from self._products_json()
@@ -372,14 +376,14 @@ class ShopifyScraper:
             conn = root["products"]
             items = conn["nodes"]
             total += len(items)
-            log.info("Page %d: %d products (%d fetched this run)", page, len(items), total)
+            log.info("Page %-3d  %3d products   %s so far", page, len(items), f"{total:,}")
             for p in items:
                 p["options"] = [{"name": o.get("name"),
                                  "values": [v.get("name") for v in o.get("optionValues") or []]}
                                 for o in p.get("options") or []]
                 yield self._product(p, [i.get("url") for i in p["images"]["nodes"]], page)
             if not conn["pageInfo"]["hasNextPage"] or not items:
-                log.info("Reached the end of the product list.")
+                log.info("✔ Reached the end of the product list")
                 return
             after = conn["pageInfo"]["endCursor"]
             self.page = page + 1
@@ -395,10 +399,10 @@ class ShopifyScraper:
             r.raise_for_status()
             items = r.json().get("products", [])
             if not items:
-                log.info("Reached the end of the product list.")
+                log.info("✔ Reached the end of the product list")
                 return
             total += len(items)
-            log.info("Page %d: %d products (%d fetched this run)", page, len(items), total)
+            log.info("Page %-3d  %3d products   %s so far", page, len(items), f"{total:,}")
             for p in items:
                 yield self._product(p, [i.get("src") for i in p.get("images", [])], page)
             self.page = page + 1
@@ -449,7 +453,7 @@ class MasterCsv:
             return False
         self.seen.add(key)
         if not p.images:
-            log.info("no images: %s", p.title)
+            log.debug("no images, skipped: %s", p.title)
             return False
         self.products += 1
         n = self.products
@@ -516,16 +520,65 @@ def collect(products: Iterator[Product], master: MasterCsv, scraper, resume_info
 
 
 # --------------------------------------------------------------------------- #
+# Terminal look (symbols + colours; plain text when output is redirected)
+# --------------------------------------------------------------------------- #
+for _stream in (sys.stdout, sys.stderr):  # Windows consoles: never crash on ✔ ➜ 📦 ...
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+if USE_COLOR and os.name == "nt":
+    os.system("")  # turns on ANSI colours in the Windows console
+
+
+def paint(text: str, code: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
+
+
+def bold(t): return paint(t, "1")
+def dim(t): return paint(t, "2")
+def green(t): return paint(t, "32")
+def yellow(t): return paint(t, "33")
+def red(t): return paint(t, "31")
+def cyan(t): return paint(t, "36")
+
+
+LINE = "━" * 58
+
+
+class PrettyFormatter(logging.Formatter):
+    ICONS = {logging.DEBUG: ("·", dim), logging.INFO: ("▸", cyan),
+             logging.WARNING: ("⚠", yellow), logging.ERROR: ("✖", red)}
+
+    def format(self, record: logging.LogRecord) -> str:
+        icon, color = self.ICONS.get(record.levelno, ("▸", cyan))
+        msg = record.getMessage()
+        if msg.startswith("✔"):
+            icon, msg, color = "✔", msg[1:].lstrip(), green
+        when = time.strftime("%H:%M:%S", time.localtime(record.created))
+        text = color(msg) if record.levelno >= logging.WARNING else msg
+        return f"  {dim(when)}  {color(icon)}  {text}"
+
+
+def banner() -> None:
+    print()
+    print("  " + cyan(LINE))
+    print("  " + bold("  🛍️  Shopify Image Scraper") + dim("   ·   every product, every image link"))
+    print("  " + cyan(LINE))
+    print()
+
+
+# --------------------------------------------------------------------------- #
 # Settings (config.json, kept outside the code) + prompts
 # --------------------------------------------------------------------------- #
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
 EXAMPLE_CONFIG_PATH = HERE / "config.example.json"
-DEFAULT_CSV_DIR = HERE / "csv"
 DEFAULT_CONFIG = {
-    "store_url": "https://your-store.com",       # placeholder -> asked in the terminal
+    "store_url": "https://your-store.com",       # optional; placeholder -> asked in the terminal
     "collection": "",                           # "" = whole store, or a collection handle e.g. "men"
-    "csv_dir": "C:/path/to/your/csv-folder",    # placeholder -> asked in the terminal
+    "csv_dir": "C:/path/to/your/csv-folder",    # optional; placeholder -> asked in the terminal
     # ---- rate-limit control ----
     "delay": 2.0,           # seconds between requests to the store
     "cooldown": 60,         # first pause (seconds) when blocked; doubles each time
@@ -542,7 +595,7 @@ def is_placeholder(value) -> bool:
 
 def load_config() -> dict:
     """config.json is personal (not in git). On the first run it's created from
-    config.example.json, so it starts with placeholders that get asked for."""
+    config.example.json, so it starts with placeholders."""
     if not CONFIG_PATH.exists():
         src = EXAMPLE_CONFIG_PATH.read_text(encoding="utf-8") if EXAMPLE_CONFIG_PATH.exists() \
             else json.dumps(DEFAULT_CONFIG, indent=2)
@@ -551,31 +604,24 @@ def load_config() -> dict:
     try:
         saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
-        sys.exit(f"config.json is not valid JSON ({e}). Fix it, or delete it to start from the example.")
+        sys.exit(red(f"  ✖ config.json is not valid JSON ({e}). Fix it, or delete it to start fresh."))
     cfg.update({k: v for k, v in saved.items() if k in DEFAULT_CONFIG})
     if set(saved) != set(DEFAULT_CONFIG):  # old/extra/missing keys -> tidy it up
-        save_config(cfg)
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     return cfg
 
 
-def save_config(cfg: dict) -> None:
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-
-
-def ask(question: str, default: str = "") -> str:
-    try:
-        ans = input(f"{question}{f' [{default}]' if default else ''}: ").strip().strip('"')
-    except EOFError:
-        ans = ""
-    return ans or default
-
-
-def remember(cfg: dict, key: str, value: str, what: str, no_prompt: bool) -> None:
-    if no_prompt or cfg.get(key) == value:
-        return
-    if ask(f"Save this {what} in config.json for next time? (y/n)", "y").lower().startswith("y"):
-        cfg[key] = value
-        save_config(cfg)
+def ask(question: str, example: str) -> str:
+    """Ask until something is typed. Ctrl+C / end of input quits."""
+    while True:
+        try:
+            ans = input(f"  {cyan('➜')}  {bold(question)} {dim(f'(e.g. {example})')}: ").strip().strip('"')
+        except EOFError:
+            print()
+            sys.exit(red("  ✖ No answer given."))
+        if ans:
+            return ans
+        print(yellow("     Please type a value."))
 
 
 def usable_folder(folder: str) -> Path | None:
@@ -585,25 +631,34 @@ def usable_folder(folder: str) -> Path | None:
         path.mkdir(parents=True, exist_ok=True)
         return path
     except OSError as e:
-        log.warning("Can't use the folder %r (%s).", folder, e)
+        print(yellow(f"     Can't use the folder {folder} ({e.strerror or e})"))
         return None
 
 
+def resolve_store(args: argparse.Namespace, cfg: dict) -> str:
+    """Store URL: command line, then config.json, then asked in the terminal."""
+    if not args.url and not is_placeholder(cfg.get("store_url")):
+        args.url = cfg["store_url"]
+        if args.collection is None and cfg.get("collection"):
+            args.collection = cfg["collection"]
+    if not args.url:
+        if args.no_prompt:
+            sys.exit(red("  ✖ No store URL. Pass one (shopify_scraper.py https://store.com) "
+                         "or set \"store_url\" in config.json."))
+        args.url = ask("Store URL", "https://your-store.com")
+    return normalize_base(args.url)
+
+
 def resolve_csv_dir(args: argparse.Namespace, cfg: dict) -> Path:
-    """CSV folder: --csv-out, then config.json, then a question in the terminal.
-    A placeholder, empty or unusable path falls through to the next option."""
+    """CSV folder: --csv-out, then config.json, then asked in the terminal (no default)."""
     for folder in (args.csv_out, cfg.get("csv_dir")):
         if folder and not is_placeholder(folder) and (path := usable_folder(folder)):
             return path
     if args.no_prompt:
-        log.info("No usable CSV folder in config.json; using %s", DEFAULT_CSV_DIR)
-        return usable_folder(str(DEFAULT_CSV_DIR)) or DEFAULT_CSV_DIR
+        sys.exit(red("  ✖ No CSV folder. Pass --csv-out FOLDER or set \"csv_dir\" in config.json."))
     while True:
-        folder = ask("Folder to save the CSV in (Enter = default)", str(DEFAULT_CSV_DIR))
-        if path := usable_folder(folder):
-            remember(cfg, "csv_dir", folder, "folder", args.no_prompt)
+        if path := usable_folder(ask("Folder to save the CSV", r"D:\exports")):
             return path
-        print("  That folder can't be used. Try another one.")
 
 
 # --------------------------------------------------------------------------- #
@@ -611,85 +666,50 @@ def resolve_csv_dir(args: argparse.Namespace, cfg: dict) -> Path:
 # --------------------------------------------------------------------------- #
 def parse_args(argv=None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
+        prog="shopify_scraper.py",
         description="Collect every product's image links from a Shopify store into one master CSV.")
-    ap.add_argument("url", nargs="?", help="Store URL, e.g. https://www.jockey.in (else config.json, else asked)")
-    ap.add_argument("--site", help="Use a saved store from sites.json")
-    ap.add_argument("--sites-file", default=str(HERE / "sites.json"))
-    ap.add_argument("--collection", help="Only one collection, e.g. 'men' (from /collections/men)")
-    ap.add_argument("--csv-out", help="CSV folder for this run (overrides config.json)")
-    ap.add_argument("--max-products", type=int, help="Stop after N products (for testing)")
-    ap.add_argument("--delay", type=float, help="Seconds between requests (overrides config.json)")
-    ap.add_argument("--fresh", action="store_true",
-                    help="Ignore an unfinished earlier run and start again from the beginning")
-    ap.add_argument("--start-page", type=int,
+    ap.add_argument("url", nargs="?", help="Store URL, e.g. https://your-store.com (asked if omitted)")
+    ap.add_argument("-o", "--csv-out", metavar="FOLDER", help="Folder for the CSV (asked if omitted)")
+    ap.add_argument("-n", "--max-products", type=int, metavar="N", help="Stop after N products, e.g. -n 150")
+    ap.add_argument("-c", "--collection", metavar="HANDLE", help="Only one collection, e.g. 'men'")
+    ap.add_argument("--delay", type=float, metavar="SEC", help="Seconds between requests (default 2)")
+    ap.add_argument("--fresh", action="store_true", help="Ignore an unfinished earlier run and start over")
+    ap.add_argument("--start-page", type=int, metavar="N",
                     help="Continue from /products.json page N, adding to the existing CSV")
-    ap.add_argument("--no-prompt", action="store_true", help="Never ask questions (for scripts/schedulers)")
+    ap.add_argument("--no-prompt", action="store_true", help="Never ask questions (scripts / schedulers)")
     ap.add_argument("-v", "--verbose", action="store_true", help="Detailed log")
-    args = ap.parse_args(argv)
-
-    profiles = {}
-    if Path(args.sites_file).exists():
-        profiles = json.loads(Path(args.sites_file).read_text(encoding="utf-8"))
-    if args.site:
-        if args.site not in profiles:
-            sys.exit(f"'{args.site}' is not in {args.sites_file}. Saved stores: {', '.join(profiles)}")
-        for k, v in profiles[args.site].items():
-            k = k.replace("-", "_")
-            if getattr(args, k, None) in (None, False):  # command-line flags win
-                setattr(args, k, v)
-    args.profiles = profiles
-    return args
+    return ap.parse_args(argv)
 
 
-def resolve_store(args: argparse.Namespace, cfg: dict) -> None:
-    """Store URL: command line / --site, then config.json, then a question in the terminal."""
-    if not args.url and not is_placeholder(cfg.get("store_url")):
-        args.url = cfg["store_url"]
-        if args.collection is None and cfg.get("collection"):
-            args.collection = cfg["collection"]
-    if args.url:
-        return
-    if args.no_prompt:
-        sys.exit("No store URL. Give one (shopify_scraper.py https://store.com), use --site, "
-                 "or set \"store_url\" in config.json.")
-    if args.profiles:
-        print("Saved stores (sites.json):", ", ".join(args.profiles))
-    while not args.url:
-        answer = ask("Store URL or saved store name (e.g. https://www.jockey.in)")
-        if answer in args.profiles:
-            args.site = answer
-            for k, v in args.profiles[answer].items():
-                if getattr(args, k.replace("-", "_"), None) in (None, False):
-                    setattr(args, k.replace("-", "_"), v)
-        elif answer:
-            args.url = answer
-            remember(cfg, "store_url", normalize_base(answer), "store", args.no_prompt)
-    if args.max_products is None:
-        n = ask("How many products? (Enter = all)")
-        args.max_products = int(n) if n.isdigit() else None
+def summary_row(icon: str, label: str, value) -> None:
+    print(f"   {icon}  {label:<13} {bold(str(value))}")
 
 
 def main(argv=None) -> None:
     args = parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                        format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(PrettyFormatter())
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, handlers=[handler])
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+    banner()
     cfg = load_config()
-    resolve_store(args, cfg)
+    base = resolve_store(args, cfg)
     csv_dir = resolve_csv_dir(args, cfg)
     delay = cfg["delay"] if args.delay is None else args.delay
+    print()
 
-    base = normalize_base(args.url)
     session = make_session(delay=delay, cooldown=cfg["cooldown"],
                            max_cooldown=cfg["max_cooldown"], max_blocks=cfg["max_blocks"])
-    log.info("Store: %s%s  |  %.1fs between requests", base,
-             f"  |  collection: {args.collection}" if args.collection else "", delay)
     if not ShopifyScraper.detect(session, base):
-        sys.exit(f"\n{base} doesn't look like a Shopify store (or it's blocking us right now).\n"
-                 "Tip: some stores use a custom front-end; try the store's xxx.myshopify.com address.")
+        print(red(f"  ✖ {base} doesn't look like a Shopify store (or it's blocking us right now)."))
+        print(dim("    Tip: stores with a custom front-end work via their xxx.myshopify.com address."))
+        sys.exit(1)
+    log.info("✔ Shopify store found: %s%s", base,
+             f"  ·  collection: {args.collection}" if args.collection else "")
 
-    site = site_name(base)
     suffix = f"_{safe_filename(args.collection)}" if args.collection else ""
-    master = MasterCsv(csv_dir / f"{site}{suffix}_products.csv")
+    master = MasterCsv(csv_dir / f"{site_name(base)}{suffix}_products.csv")
 
     # ---- resume an unfinished run? (test runs with --max-products never resume)
     resume_info = None
@@ -710,8 +730,8 @@ def main(argv=None) -> None:
             master.load_existing()
             if same_run:
                 master.seen = set(progress.get("seen", []))
-            log.info("Resuming from page %d: %d products already in the CSV. "
-                     "(Use --fresh to start over.)", start_page, master.products)
+            log.info("Resuming from page %d · %s products already in the CSV (--fresh to start over)",
+                     start_page, f"{master.products:,}")
         else:
             master.clear_progress()
 
@@ -719,31 +739,33 @@ def main(argv=None) -> None:
                              cursor=cursor, api=api)
     started = time.monotonic()
     stats = collect(scraper.products(), master, scraper, resume_info, max_products=args.max_products)
-    took = time.monotonic() - started
+    took = int(time.monotonic() - started)
 
+    ok = not stats["error"]
     print()
-    print("=" * 60)
-    print(f"  TOTAL PRODUCTS : {master.products}" + (f"   ({stats['added']} added this run)"
-                                                     if start_page > 1 else ""))
-    print(f"  Image links    : {len(master.rows)}")
+    print("  " + (green(LINE) if ok else yellow(LINE)))
+    title = "✔  Done" if ok else "⚠  Stopped early"
+    print("  " + bold(green(f"  {title}") if ok else yellow(f"  {title}"))
+          + dim(f"   ·   {took // 60}m {took % 60}s" if took >= 60 else f"   ·   {took}s"))
+    print("  " + (green(LINE) if ok else yellow(LINE)))
+    n_added = stats["added"]
+    added = "   " + dim(f"(+{n_added:,} this run)") if start_page > 1 else ""
+    summary_row("📦", "Products", f"{master.products:,}" + added)
+    summary_row("🖼️", "Image links", f"{len(master.rows):,}")
     if stats["no_images"]:
-        print(f"  Skipped        : {stats['no_images']} product(s) with no images")
+        summary_row("⏭️", "Skipped", f"{stats['no_images']:,} without images")
     if session.blocks:
-        print(f"  Rate limits    : store slowed us down {session.blocks} time(s); handled automatically")
-    print(f"  Source         : {'Storefront API' if scraper.used == 'storefront' else '/products.json'}")
-    print(f"  Time           : {took:.0f}s")
-    print(f"  Master CSV     : {master.path.resolve()}")
-    print("=" * 60)
-    if stats["error"]:
-        print(f"\n  {stats['error']}")
-        print("  The CSV has everything collected so far.")
+        summary_row("🐢", "Slow-downs", f"{session.blocks} (handled automatically)")
+    summary_row("⚡", "Source", "Storefront API" if scraper.used == "storefront" else "/products.json")
+    summary_row("📄", "CSV", master.path.resolve())
+    print()
+    if not ok:
+        print(yellow(f"  ⚠  {stats['error']}"))
+        print("     The CSV has everything collected so far.")
         if resume_info is not None:
-            print(f"  Run the SAME command again later and it continues from page {scraper.page}.")
-        else:
-            print("  Run the same command again later for the complete list.")
+            print(f"     Run the {bold('same command')} again later to continue from page {scraper.page}.")
+        print()
         sys.exit(1)
-    if resume_info is not None and stats["finished"]:
-        print("\n  Complete: the whole product list was collected.")
 
 
 if __name__ == "__main__":

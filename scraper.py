@@ -11,7 +11,8 @@ image links, and ends with the total number of (unique) products:
     Total Products, 1234
 
 Works on any store:
-  * shopify  - the store's public /products.json API (fast, complete).
+  * shopify  - the store's public Storefront API (GraphQL, 250 products per request,
+               a whole store in under a minute), falling back to /products.json.
   * generic  - any other site: product links from sitemap.xml or a listing page,
                images from JSON-LD, og:image and an optional CSS selector.
   * auto     - (default) shopify if the site supports it, otherwise generic.
@@ -132,12 +133,16 @@ class PoliteSession(requests.Session):
             return len(body) < 30_000 and any(m.lower() in body.lower() for m in CHALLENGE_MARKERS)
         return False
 
-    def request(self, method, url, *args, **kwargs):
+    def request(self, method, url, *args, probe: bool = False, **kwargs):
+        """probe=True: one paced request, answer returned as-is (no pause/retry).
+        Used to ask "does this site support X?" without waiting minutes on a 429."""
         host = urlparse(url).netloc.lower()
         strikes = 0
         while True:
             self._wait_turn(host)
-            log.debug("GET %s", url)
+            log.debug("%s %s", method, url)
+            if probe:
+                return super().request(method, url, *args, **kwargs)
             try:
                 r = super().request(method, url, *args, **kwargs)
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
@@ -230,19 +235,66 @@ COLOR_NAMES = {"color", "colour", "colors", "colours", "shade"}
 SIZE_NAMES = {"size", "sizes"}
 
 
+STOREFRONT_VERSION = "2025-10"  # Shopify serves the oldest supported version if this one retires
+PRODUCT_FIELDS = """pageInfo { hasNextPage endCursor }
+  nodes { id title handle tags options { name optionValues { name } } images(first: 250) { nodes { url } } }"""
+STOREFRONT_QUERY = "query($after: String) { products(first: 250, after: $after) { %s } }" % PRODUCT_FIELDS
+STOREFRONT_COLLECTION_QUERY = ("query($after: String, $handle: String!) { collection(handle: $handle) "
+                               "{ products(first: 250, after: $after) { %s } } }" % PRODUCT_FIELDS)
+
+
+class StorefrontUnavailable(Exception):
+    """The store doesn't allow tokenless Storefront API access (use /products.json)."""
+
+
+def is_shopify_response(r: requests.Response) -> bool:
+    h = {k.lower(): v for k, v in r.headers.items()}
+    return h.get("powered-by", "").lower() == "shopify" or "x-shopid" in h or "x-shopify-stage" in h
+
+
 class ShopifyScraper:
+    """Two public Shopify sources, fastest first:
+
+    1. Storefront API (POST /api/<version>/graphql.json, no token needed): the API
+       Shopify provides for storefronts and apps. 250 products with all images and
+       options per request, with its own, much more generous limits.
+    2. /products.json?limit=250&page=N: the classic feed. Same data, but stores
+       often rate-limit it hard (e.g. right after the first page).
+    """
+
     def __init__(self, session: requests.Session, base: str, collection: str | None = None,
-                 start_page: int = 1):
+                 start_page: int = 1, cursor: str | None = None, api: str = "auto"):
         self.s, self.base, self.collection = session, base, collection
         self.page = start_page  # the list page being fetched/processed right now
+        self.cursor = cursor    # Storefront API: where page `start_page` begins
+        self.api = api          # "auto" | "storefront" | "json"
+        self.used = ""          # the source actually used
+        self.page_cursor: dict[int, str | None] = {}
+
+    @property
+    def graphql_url(self) -> str:
+        return f"{self.base}/api/{STOREFRONT_VERSION}/graphql.json"
 
     @staticmethod
-    def detect(session: requests.Session, base: str) -> bool:
+    def detect(session: PoliteSession, base: str) -> bool:
         try:
-            r = session.get(f"{base}/products.json", params={"limit": 1}, timeout=20)
-            return r.ok and "products" in r.json()
+            r = session.post(f"{base}/api/{STOREFRONT_VERSION}/graphql.json", probe=True, timeout=20,
+                             json={"query": "{ shop { name } }"})
+            if r.ok and "shop" in ((r.json() or {}).get("data") or {}):
+                return True
+        except Exception:
+            pass
+        try:
+            r = session.get(f"{base}/products.json", params={"limit": 1}, probe=True, timeout=20)
+            if r.ok:
+                return "products" in r.json()
+            return is_shopify_response(r)  # e.g. a 429 that clearly comes from Shopify
         except Exception:
             return False
+
+    def resume_point(self, page: int) -> dict:
+        """What to store so a later run can continue at `page`."""
+        return {"api": self.used, "next_page": page, "cursor": self.page_cursor.get(page)}
 
     @staticmethod
     def color_and_size(p: dict) -> tuple[str, str]:
@@ -272,7 +324,73 @@ class ShopifyScraper:
             size = " | ".join(([size] if size else []) + other)
         return color, size
 
+    def _product(self, p: dict, images: list, page: int) -> Product:
+        color, size = self.color_and_size(p)
+        return Product(
+            title=p.get("title") or p.get("handle", ""),
+            url=f"{self.base}/products/{p.get('handle')}",
+            images=dedupe(abs_url(u, self.base) for u in images if u),
+            id=str(p.get("id", "")).rsplit("/", 1)[-1],  # gid://shopify/Product/123 -> 123
+            color=color,
+            size=size,
+            page=page,
+        )
+
     def products(self) -> Iterator[Product]:
+        if self.api in ("auto", "storefront"):
+            try:
+                yield from self._storefront()
+                return
+            except StorefrontUnavailable as e:
+                log.info("Storefront API not available here (%s); using /products.json instead.", e)
+                # different ordering -> restart the list; products already in the CSV are skipped
+                self.page, self.cursor = 1, None
+        yield from self._products_json()
+
+    def _storefront(self) -> Iterator[Product]:
+        self.used = "storefront"
+        after, total, first = self.cursor, 0, True
+        query = STOREFRONT_COLLECTION_QUERY if self.collection else STOREFRONT_QUERY
+        while True:
+            page = self.page
+            self.page_cursor[page] = after
+            variables = {"after": after, **({"handle": self.collection} if self.collection else {})}
+            # the very first request is a probe: if the store refuses, fall back at once
+            r = self.s.post(self.graphql_url, json={"query": query, "variables": variables},
+                            timeout=60, probe=first)
+            try:
+                data = r.json() or {}
+            except ValueError:
+                data = {}
+            if first and (not r.ok or "data" not in data):
+                raise StorefrontUnavailable(f"HTTP {r.status_code}")
+            if data.get("errors") or not data.get("data"):
+                msg = "; ".join(str(e.get("message")) for e in data.get("errors") or [])[:200]
+                raise StorefrontUnavailable(msg or f"HTTP {r.status_code}")
+            first = False
+            root = data["data"]
+            if self.collection:
+                if not root.get("collection"):
+                    raise StorefrontUnavailable(f"no collection '{self.collection}'")
+                root = root["collection"]
+            conn = root["products"]
+            items = conn["nodes"]
+            total += len(items)
+            log.info("Page %d: %d products (%d fetched this run)", page, len(items), total)
+            for p in items:
+                p["options"] = [{"name": o.get("name"),
+                                 "values": [v.get("name") for v in o.get("optionValues") or []]}
+                                for o in p.get("options") or []]
+                yield self._product(p, [i.get("url") for i in p["images"]["nodes"]], page)
+            if not conn["pageInfo"]["hasNextPage"] or not items:
+                log.info("Reached the end of the product list.")
+                return
+            after = conn["pageInfo"]["endCursor"]
+            self.page = page + 1
+            self.page_cursor[self.page] = after
+
+    def _products_json(self) -> Iterator[Product]:
+        self.used = "json"
         path = f"/collections/{self.collection}/products.json" if self.collection else "/products.json"
         total = 0
         while True:
@@ -286,16 +404,7 @@ class ShopifyScraper:
             total += len(items)
             log.info("Page %d: %d products (%d fetched this run)", page, len(items), total)
             for p in items:
-                color, size = self.color_and_size(p)
-                yield Product(
-                    title=p.get("title") or p.get("handle", ""),
-                    url=f"{self.base}/products/{p.get('handle')}",
-                    images=dedupe(abs_url(i["src"], self.base) for i in p.get("images", []) if i.get("src")),
-                    id=str(p.get("id", "")),
-                    color=color,
-                    size=size,
-                    page=page,
-                )
+                yield self._product(p, [i.get("src") for i in p.get("images", [])], page)
             self.page = page + 1
 
 
@@ -531,7 +640,7 @@ def collect(products: Iterator[Product], master: MasterCsv, scraper, resume_info
             if paged and p.page != current_page:
                 if current_page is not None:  # previous page fully done -> checkpoint
                     master.save()
-                    master.save_progress({**resume_info, "next_page": p.page})
+                    master.save_progress({**resume_info, **scraper.resume_point(p.page)})
                 current_page = p.page
             if master.add(p):
                 stats["added"] += 1
@@ -551,7 +660,7 @@ def collect(products: Iterator[Product], master: MasterCsv, scraper, resume_info
             if stats["finished"]:
                 master.clear_progress()
             else:
-                master.save_progress({**resume_info, "next_page": scraper.page})
+                master.save_progress({**resume_info, **scraper.resume_point(scraper.page)})
     return stats
 
 
@@ -672,6 +781,8 @@ def main(argv=None) -> None:
     if mode == "auto":
         mode = "shopify" if ShopifyScraper.detect(session, base) else "generic"
     log.info("Site: %s  |  method: %s  |  %.1fs between requests", base, mode, delay)
+    if mode == "shopify":
+        log.info("Using Shopify's Storefront API (falls back to /products.json if the store blocks it).")
 
     site = site_name(base)
     suffix = f"_{safe_filename(args.collection)}" if args.collection else ""
@@ -679,15 +790,19 @@ def main(argv=None) -> None:
 
     # ---- resume an unfinished run? (Shopify only; test runs with --max-products never resume)
     resume_info = None
-    start_page = 1
+    start_page, cursor, api = 1, None, "auto"
     if mode == "shopify" and not args.max_products:
         resume_info = {"site": base, "collection": args.collection or ""}
         progress = master.load_progress()
         same_run = progress and {k: progress.get(k) for k in resume_info} == resume_info
         if args.start_page:
-            start_page = args.start_page
+            start_page, api = args.start_page, "json"  # page numbers belong to /products.json
         elif same_run and not args.fresh:
             start_page = int(progress.get("next_page", 1))
+            if progress.get("api") == "storefront" and progress.get("cursor"):
+                cursor, api = progress["cursor"], "storefront"
+            elif start_page > 1:
+                api = "json"
         if start_page > 1:
             master.load_existing()
             if same_run:
@@ -698,7 +813,8 @@ def main(argv=None) -> None:
             master.clear_progress()
 
     if mode == "shopify":
-        scraper = ShopifyScraper(session, base, collection=args.collection, start_page=start_page)
+        scraper = ShopifyScraper(session, base, collection=args.collection, start_page=start_page,
+                                 cursor=cursor, api=api)
     else:
         scraper = GenericScraper(session, base, product_pattern=args.product_pattern or r"/products?/",
                                  image_selector=args.image_selector, start_urls=args.start_url)

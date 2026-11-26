@@ -108,17 +108,23 @@ Created automatically on the first run, next to `scraper.py` (it's personal, so 
 ## Speed and rate limits
 
 ### How fast is it?
-On Shopify stores the product list comes **250 products per request**, and no images are downloaded,
-so the whole store is only a handful of requests:
+On Shopify stores it uses two public sources, fastest first:
+
+1. **Storefront API** (`/api/<version>/graphql.json`, no key needed). This is the API Shopify provides
+   for storefronts and apps. It returns 250 products with all their images, colours and sizes per request,
+   and it has its own, much more generous limits.
+   **Jockey test: all 3,724 products and 29,006 image links in 37 seconds, with no rate limiting.**
+2. **`/products.json`**: the classic feed. It has the same data, but stores often rate-limit it hard,
+   sometimes right after the first 250 products. It's used only if a store turns the Storefront API off.
+
+The log tells you which one is used:
+`Storefront API not available here (HTTP 401); using /products.json instead.`
 
 | Store size | Requests | Time at the default `delay: 2` |
 |---|---|---|
 | 1,000 products | 4 | ~10 s |
-| 5,000 products | 20 | ~1 min |
+| 5,000 products | 20 | ~50 s |
 | 20,000 products | 80 | ~4 min |
-
-This is already the fastest clean method: one request returns 250 products with all their images,
-colours and sizes. Nothing else on a Shopify store gives more data per request.
 
 ### Pick a pace
 | Situation | `delay` |
@@ -148,12 +154,13 @@ That's normal. Leave it running.
 ### Not included on purpose: proxies, IP rotation, browser cookies
 They're deliberately left out. Rotating IPs or reusing a browser's
 bot-check cookies is a way around the site's own limits, which breaks most stores' terms of use and gets
-public scraper repos reported. They also wouldn't make a normal run meaningfully faster here: a full store is already only a few dozen requests.
+public scraper repos reported. They also aren't needed, because the Storefront API above already gets a whole
+store in under a minute.
 
 ### Resume: continue where it stopped
 
 The CSV is saved after **every page** (250 products), and the next page to fetch is stored in
-`csv\<site>_products.progress.json`. So if a run stops (site blocking, `Ctrl+C`, internet drop, PC restart):
+`csv\<site>_products.progress.json`, including which source was used, so a resumed run continues on the same one. So if a run stops (site blocking, `Ctrl+C`, internet drop, PC restart):
 
 1. Wait a while (30–60 min, or until the next day if the site blocked you a lot).
 2. Run the **same command** again:
@@ -168,7 +175,7 @@ The CSV is saved after **every page** (250 products), and the next page to fetch
 |---|---|
 | Continue an unfinished run | the same command as before |
 | Start over from page 1 | add `--fresh` |
-| Continue from a specific page, adding to the existing CSV | add `--start-page 3` |
+| Continue from a specific `/products.json` page, adding to the existing CSV | add `--start-page 3` |
 
 Test runs with `--max-products` never save or use a resume point.
 
